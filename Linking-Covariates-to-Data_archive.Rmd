@@ -1,0 +1,513 @@
+---
+title: "Linking Covariates to Data"
+author: "Dr. Curry J. Cunningham"
+date: "Feburary 10, 2018"
+output:
+  html_document:
+    fig_caption: yes
+    highlight: espresso
+    number_sections: yes
+    theme: cerulean
+    toc: yes
+    toc_depth: 2
+  pdf_document:
+    fig_caption: yes
+    number_sections: yes
+    toc: yes
+---
+
+#Purpose:
+The purpose of this document is to describe how the covariate data may be attached to a size data summary file.
+
+####This is tricky for several reasons:
+* We need to account for species and covariate specific offsets when joining the datasets.
+    +  Offsets are the difference between the return year (year of observation) and the year in which the salmon would interact with the covariate. 
+* Datasets vary in number of years.
+* Data are too numerous to loop through and look up each row (i.e. year by location by species observation), and append the correctly offset covariate values.
+* We want to introduce NA's for unavailable covariate data, rather than removing observations from the original summary dataset. 
+
+***
+#Control Section
+
+##Years Used for Mean-Variance Standardizing Covariates
+```{r}
+std.min.yr <- 1970
+std.max.yr <- 2015
+```
+
+***
+
+#Initial Setup
+
+##Get necessary packages
+```{r, message=FALSE, include=TRUE} 
+require(tidyverse)
+require(reshape2)
+require(xlsx)
+require(knitr)
+require(viridis)
+require(readxl)
+```
+
+##Source user-created functions we might need
+```{r}
+source(paste0(getwd(),"/subset-minLength-yrs.R"))
+source(paste0(getwd(),"/rename-LocationID-multiples.R"))
+```
+
+***
+
+##Define workflow paths
+*Assumes you are working from the sasap-size-declines R project
+```{r}
+wd <- getwd() 
+output.dir <- paste0(wd,"/Output")
+figs.dir <- paste0(wd,"/Figs")
+data.dir <- paste0(wd,"/Data")
+```
+
+***
+##Define Covariate Input File **Name**
+*Assumes you are working from the sasap-size-declines R project
+```{r}
+#covar.file.name <- "Drivers Data and Offsets updated 2018-04-10.xlsx"
+covar.file.name <- "Drivers Data and Offsets updated 2018-11-13.xlsx"
+#import this data from KNB:
+#Krista B Oke, Curry Cunningham, and Peter Westley. 2020. Collated dataset of covariates that could influence body #size of Alaska salmon. Knowledge Network for Biocomplexity. doi:10.5063/F137773P
+#rename as necessary
+```
+
+***
+##Load Size data
+```{r}
+# all.dat <- readRDS(paste0(wd,"/Data/ASL_Mean_noAge_noType.rds")) 
+all.dat <- readRDS(paste0(wd,"/Data/ASL_Mean_noAge_NEW.rds")) 
+#all.dat <- na.omit(all.dat) #Removes a bunch of samples with SD=NA and NA for ProjectType
+all.dat <- all.dat[all.dat$LocationID!='unknown' & !is.na(all.dat$mean_length)
+                   & !is.na(all.dat$sampleYear),]
+
+species <- unique(all.dat$Species)
+n.species <- length(species)
+
+types <- unique(all.dat$ASLProjectType)
+n.types <- length(types)
+
+years <- min(all.dat$sampleYear):max(all.dat$sampleYear)
+n.years <- length(years)
+
+kable(head(all.dat), digits=2)
+```
+
+***
+#Creation of new data object by combining lists
+##Load/Craft Drivers Data
+
+* `covars.dat` - The matrix of covariate (column) values, by year of observation (row)
+* `offsets.dat` - Hypothesized offsets between the year in which returning salmon were observed and measured (sampleYear) and the year in which those salmon are expected to have encountered the covariate effect.
+
+```{r}
+covars.dat <- read.xlsx(file=paste0(data.dir,"/",covar.file.name), sheetName='Input_Drivers', 
+                          startRow=2, header=TRUE, colClasses=rep('numeric',43))
+
+# covars.dat.alt <- read_excel(path=paste0(data.dir,"/",covar.file.name), sheet='Input_Drivers', 
+                          # skip=1, col_types="numeric", na="NA")
+# covars.dat <- data.frame(read_xlsx(path=paste0(data.dir,"/",covar.file.name), sheet='Input_Drivers', skip=1, na='NA')
+
+offsets.dat <- read.xlsx(file=paste0(data.dir,"/",covar.file.name), sheetName='Input_Offsets')
+
+#import offsets as a csv file from KNB:
+#Krista B Oke, Curry Cunningham, and Peter Westley. 2020. Collated dataset of covariates that could influence body #size of Alaska salmon. Knowledge Network for Biocomplexity. doi:10.5063/F137773P
+#rename as necessary
+
+```
+
+##Limit the `offsets.dat` based on `Include`
+```{r}
+offsets.dat <- offsets.dat %>% subset(Include=='y')
+```
+
+##Determine list of active covariates
+```{r}
+covars <- as.character(offsets.dat$Name)
+n.covars <- length(covars)
+```
+
+##Convert to LISTS, remove unnecessary columns (select) columns, then re-name columns
+```{r, warnings=FALSE}
+covars.list <- covars.dat %>% dplyr::select(one_of(c('Year',covars))) %>% 
+                 gather(key=Covar, value=value, -Year, na.rm=FALSE)
+names(covars.list) <- c('Year','Covar','value')
+
+offsets.list <- offsets.dat %>% dplyr::select(-c(Covariate, Include)) %>% gather(key=Species, value=Offset, -Name, na.rm=FALSE)
+names(offsets.list) <- c('Covar','Species','Offset')
+```
+
+##Mean-variance (z) standardize the covariate data, based on `std.min.yr` and `std.max.yr`
+###Determine mean/sd for each covariate
+```{r}
+# covars.mean.sd <- covars.list %>% group_by(Covar) %>% summarize('mu'=mean(value, na.rm=TRUE), 'sd'=sd(value, na.rm=TRUE))
+
+covars.mean.sd <- covars.list %>% subset(Year>=std.min.yr & Year<=std.max.yr) %>% group_by(Covar) %>% 
+                    summarize('mean'=mean(value, na.rm=TRUE), 
+                              'sd'=sd(value, na.rm=TRUE))
+kable(covars.mean.sd, digits=2)
+```
+
+###Added standardized value `std` to `covars.list`, based on calculated mean and sd in `mean.sd.covars`.
+```{r}
+covars.list.2 <- covars.list %>% left_join(covars.mean.sd) %>% group_by(Covar) %>% mutate(std=(value-mean)/sd)
+# covars.list.2 <- covars.list %>% group_by(Covar) %>% mutate(std=(value-
+#                                                                  mean(value[.$Year>=std.min.yr & .$Year<=std.max.yr],na.rm=TRUE))/
+#                                                             sd(value[.$Year>=std.min.yr & .$Year<=std.max.yr],na.rm=TRUE))
+kable(head(covars.list.2), digits=2)
+```
+
+###Drop `value`, `mean`, `sd`
+```{r}
+covars.list.3 <- covars.list.2 %>% dplyr::select(-c(value, mean, sd))
+```
+
+###Join list of species-specific covariate offsets from the RETURN year, to the covariate data list
+```{r, warnings=FALSE}
+# covars.list.4 <- full_join(x=covars.list.3, y=offsets.list)
+covars.list.4 <- left_join(x=covars.list.3, y=offsets.list)
+kable(head(covars.list.4), digits=2)
+```
+
+####Double check:
+Looks OK!
+  
+```{r}
+kable(head(covars.list.4[covars.list.4$Covar=='NPGO' & covars.list.4$Species=='sockeye',]), digits=2)  #Double check
+```
+```{r}
+kable(offsets.dat[offsets.dat$Name=='NPGO',])
+```
+
+```{r}
+kable(head(covars.list.4[covars.list.4$Covar=='pinkTotal' & covars.list.4$Species=='pink',]), digits=2)  #Double check
+```
+```{r}
+kable(offsets.dat[offsets.dat$Name=='pinkTotal',])
+```
+
+##Add new variable for `sampleYear`
+```{r}
+covars.list.4$sampleYear <- covars.list.4$Year + covars.list.4$Offset
+```
+
+###Double-check:
+Looks like we are good to here
+```{r}
+kable(head(covars.list.4),digits=2)
+```
+
+##Drop unnecessary levels from `covars.list.4`
+```{r}
+# covars.list.5 <- covars.list.4[,!(names(covars.list.4) %in% c('Year','Offset'))]
+covars.list.5 <- covars.list.4 %>% dplyr::select(-c(Year,Offset))
+```
+
+###Double-check: 
+Before we do the final join make sure our two objects are correct, with proper column names for join - Look good!
+```{r}
+kable(head(all.dat), digits=2)
+```
+
+```{r}
+kable(head(covars.list.5), digits=2)
+```
+
+##Left Join **updated** `covars.list.5` to `all.dat`
+```{r}
+new.list <- left_join(x=all.dat, y=covars.list.5) 
+new.dat <- new.list %>% spread(key=Covar, value=std)
+```
+
+###Double-check: What does it look like?
+We basically want the original length dataset, with covariate values appended on as columns, and the covariate values to account for the covariate and species specific OFFSETS.
+```{r}
+kable(head(new.dat), digits=2)
+```
+
+###Double-check: Did we retain the original number of observations?
+Looks good!
+```{r}
+nrow(new.dat)==nrow(all.dat) 
+```
+
+##Remove the odd column named ``<NA>``
+```{r}
+# new.dat <- new.dat %>% dplyr::select(-NA)
+new.dat <- new.dat[,-which(names(new.dat)=="<NA>")]
+```
+
+***
+
+#Regime shift factor
+
+##Add a factor `regime` designating regimes specififed by Litzow et al. 
+**Reference:**
+Litzow, M.A., and Mueter, F.J. 2014. Assessing the ecological importance of climate regime shifts: An approach from the North Pacific Ocean. Prog Oceanogr 120: 110-119.
+
+```{r}
+new.dat$regime <- NA
+new.dat$regime[which(new.dat$sampleYear < 1976)] <- "pre76"
+new.dat$regime[which(new.dat$sampleYear > 1975 & 
+                           new.dat$sampleYear < 1989)] <- "btwn76-88"
+new.dat$regime[which(new.dat$sampleYear > 1988 & 
+                           new.dat$sampleYear < 2009)] <- "btwn88-08"
+new.dat$regime[which(new.dat$sampleYear > 2008)] <- "post08"
+new.dat$regime <- factor(new.dat$regime)
+```
+
+
+***
+#Saving the output:
+##Save the covariate mean and sd values for future reference
+```{r}
+write.csv(data.frame(covars.mean.sd), file=paste0(output.dir,"/covars.mean.sd_dec.csv"))
+```
+
+##Save covariates list
+```{r}
+write.csv(data.frame(covars.list.2), file=paste0(output.dir,"/covars.list_dec.csv"))
+```
+
+##Save the new dataset as a `.rds` file
+```{r}
+saveRDS(new.dat, file=paste0(output.dir,"/new.dat_dec.rds"))
+```
+
+##Save the new dataset as a `.csv` file
+```{r}
+write.csv(new.dat, file=paste0(output.dir,"/new.dat_dec.csv"))
+```
+
+##Create a subset of these data for easy upening in excel
+```{r}
+write.csv(new.dat[1:100,], file=paste0(output.dir,"/new.dat_truncated_dec.csv"))
+```
+
+#Exploring Covariate Data
+##Plot **correlation** among covariates
+```{r, warning=FALSE}
+require(corrplot)
+head(covars.list.3)
+
+mtx.cov <- covars.list.3 %>% spread(key='Covar', value='std') %>% dplyr::select(-Year)
+cov.cor <- cor(mtx.cov, use='pairwise.complete.obs')
+pdf(paste0(figs.dir,"/Covariate Correlation.pdf"), heigh=8, width=8)
+# png(paste0(figs.dir,"/Covariate Correlation.png"), height=600, width=600, res=500)
+corrplot.mixed(cov.cor, upper='ellipse', tl.pos='lt',tl.srt=45)
+dev.off()
+corrplot.mixed(cov.cor, upper='ellipse', tl.pos='lt',tl.srt=45)
+```
+<!-- ![Pairwise correlation matrix](Figs/Covariate Correlation.png) -->
+
+The maximum correlations were, Positive: `r max(cov.cor)` Negative: `r min(cov.cor)`.
+
+##Plot time series of covariates
+###Lines
+```{r, warning=FALSE}
+g <- ggplot(covars.list.3, aes(x=Year, y=std, color=Covar)) +
+       geom_line() +
+       ylab(paste0('Z-standardized Value Relative to ', std.min.yr,'-',std.max.yr, ' Average'))
+
+ggsave(paste0(figs.dir,"/Covariates Linear.png"), plot=g, height=6, width=7, units='in', dpi=500)
+```
+
+![Standardized covariate values as lines](Figs/Covariates Linear.png)
+
+###Points
+
+```{r, warning=FALSE}
+g2 <- ggplot(covars.list.3, aes(x=Year, y=Covar, fill=std)) + 
+        geom_point(aes(cex=std), pch=21, alpha=0.75) +
+        scale_fill_distiller(palette = "Spectral") +
+        theme(legend.position='top', legend.title=element_blank()) +
+        ggtitle(paste0('Z-standardized Value Relative to ', std.min.yr,'-',std.max.yr, ' Average'))
+# g2        
+ggsave(paste0(figs.dir,"/Covariates Points.png"), plot=g2, height=7, width=8, units='in', dpi=500)
+```
+![Standardized covariate values as points](Figs/Covariates Points.png)
+
+***
+#Add **region-specific** drivers
+##Load drivers datasets
+###Regional *air* temperature data
+```{r}
+#import data from:
+#Jared Kibele and Leslie Jones. 2017. Historic air temperatures in Alaska for 1901-2015, with spatial subsetting #by region. urn:node:KNB. doi:10.5063/F1RX997V.
+#rename as needed
+
+air.dat <- read.csv(paste0(data.dir,"/air_temp_seasonal_long.csv"), header=TRUE, stringsAsFactors=FALSE)
+kable(head(air.dat), digits=2)
+```
+
+###Regional **sea surface** temperature data
+```{r}
+#import offsets as a csv file from KNB:
+#Krista B Oke, Curry Cunningham, and Peter Westley. 2020. Collated dataset of covariates that could influence body #size of Alaska salmon. Knowledge Network for Biocomplexity. doi:10.5063/F137773P
+#rename as necessary
+
+sst.dat <- read.csv(paste0(data.dir,"/longsummerSST.csv"), header=TRUE, stringsAsFactors=FALSE)
+kable(head(sst.dat), digits=2)
+```
+
+##Restructure data for attachement to `new.dat`
+###Air temperature
+Limit to only necessary variables
+```{r}
+air.dat <- air.dat %>% dplyr::select(region, temperature, year, season)
+```
+Only focus on **summertime** temperature
+```{r}
+air.dat <- air.dat %>% subset(season=='summer')
+```
+Drop `season` and rename
+```{r}
+air.dat <- air.dat %>% dplyr::select(-season)
+names(air.dat) <- c('SASAP.Region','value','Year')
+```
+
+
+###SST
+Only focus on **summertime** temperature
+```{r}
+sst.dat <- sst.dat %>% subset(season=='summer')
+```
+Drop `season` and rename
+```{r}
+sst.dat <- sst.dat %>% dplyr::select(-c(season, X))
+names(sst.dat) <- c('SASAP.Region','Year','value')
+```
+
+##Combine **SST** and **air temp** lists
+Add covariate name
+```{r}
+sst.dat$Covar <- 'SSTsummer'
+air.dat$Covar <- 'airTempSummer'
+```
+Combine lists
+```{r}
+covars.list.add <- rbind(sst.dat,air.dat)
+```
+
+##Standardize data relative to the `r std.min.yr` to `r std.max.yr` average
+```{r}
+# covars.list.add <- covars.list.add %>% group_by(SASAP.Region, Covar) %>% 
+#                      mutate(std=(value - mean(value[.$Year>=std.min.yr & .$Year<=std.max.yr], na.rm=TRUE))/
+#                               sd(value[.$Year>=std.min.yr & .$Year<=std.max.yr], na.rm=TRUE))
+
+#Calculate mean and sd
+covars.mean.sd.add <- covars.list.add %>% subset(Year>=std.min.yr & Year<=std.max.yr) %>% group_by(SASAP.Region, Covar) %>% 
+                        summarize('mean'=mean(value, na.rm=TRUE), 'sd'=sd(value, na.rm=TRUE))
+
+#Bind with covars.list
+covars.list.add <- covars.list.add %>% left_join(covars.mean.sd.add) %>% 
+                     group_by(SASAP.Region, Covar) %>% mutate(std=(value-mean)/sd)
+
+
+# temp.mean <- mean(covars.list.add$value[covars.list.add$Covar=='airTempSummer' & 
+#                                           covars.list.add$Year>=std.min.yr & 
+#                                           covars.list.add$Year<=std.max.yr &
+#                                           covars.list.add$SASAP.Region=='Cook Inlet'], na.rm=TRUE)
+# 
+# temp.sd <- sd(covars.list.add$value[covars.list.add$Covar=='airTempSummer' & 
+#                                           covars.list.add$Year>=std.min.yr & 
+#                                           covars.list.add$Year<=std.max.yr &
+#                                           covars.list.add$SASAP.Region=='Cook Inlet'], na.rm=TRUE)
+# 
+# val <- covars.list.add$value[covars.list.add$Covar=='airTempSummer' & 
+#                                covars.list.add$SASAP.Region=='Cook Inlet' &
+#                                covars.list.add$Year==2015]
+# (val-temp.mean)/temp.sd
+# tail(covars.list.add)
+
+#Remove extra variables
+covars.list.add <- covars.list.add %>% dplyr::select(-c(value, mean, sd))
+
+```
+
+
+##Get offsets for **SST** and **air temp**
+```{r}
+#Load
+temp <- read.xlsx(file=paste0(data.dir,"/",covar.file.name), sheetName='Input_Offsets', stringsAsFactors=FALSE)
+temp <- temp %>% filter(Name=='SST_AI' | Name=='AirTempSum_AI')
+temp <- temp %>% dplyr::select(-c(Covariate, Include))
+#Rename
+temp$Name <- c('SSTsummer','airTempSummer') 
+#List
+offsets.list.add <- temp %>% gather(key=Species, value=Offset, -Name, na.rm=FALSE)
+names(offsets.list.add) <- c('Covar','Species','Offset')
+```
+
+##Bind together
+```{r}
+covars.list.add <- left_join(x=covars.list.add, y=offsets.list.add)
+```
+
+##Add new variable for `sampleYear`
+```{r}
+covars.list.add$sampleYear <- covars.list.add$Year + covars.list.add$Offset
+```
+
+##Drop unnecessary columns
+```{r}
+covars.list.add <- covars.list.add %>% dplyr::select(-c(Year,Offset))
+```
+
+##Join `covars.list.add` to `new.dat`
+```{r}
+
+
+head(new.dat)
+head(covars.list.add)
+
+#Expand covars.list.add
+wide.covars.list.add <- covars.list.add %>% spread(key=Covar, value=std)
+
+new.dat.2 <- left_join(new.dat, wide.covars.list.add)
+
+new.dat.3 <- new.dat.2
+  
+  #get even vs odd
+new.dat.3$run<-new.dat.3$sampleYear%% 2 == 0 
+new.dat.3$run <- as.factor(new.dat.3$run)
+new.dat.3$run<-recode(new.dat.3$run, "TRUE"="even", "FALSE"="odd")
+
+# New for some reason we used to have a new.dat.4, it appears now that it is the same as new.dat.3
+new.dat.4 <- new.dat.3
+
+
+```
+
+##Save new object `new.dat.2`
+```{r}
+saveRDS(new.dat.2, file=paste0(output.dir,"/new.dat.2.rds"))
+write.csv(new.dat.2, file=paste0(output.dir,"/new.dat.2.csv"))
+```
+
+
+##Save new object `new.dat.3`
+```{r}
+saveRDS(new.dat.3, file=paste0(output.dir,"/new.dat.3.rds"))
+write.csv(new.dat.3, file=paste0(output.dir,"/new.dat.3.csv"))
+```
+
+##Save new object `new.dat.4`
+```{r}
+saveRDS(new.dat.4, file=paste0(output.dir,"/new.dat.4.rds"))
+write.csv(new.dat.4, file=paste0(output.dir,"/new.dat.4.csv"))
+
+
+```
+
+
+
+
+
+
+
